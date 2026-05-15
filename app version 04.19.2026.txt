@@ -1,0 +1,534 @@
+import React, { useEffect, useMemo, useState } from "react";
+import * as pdfjsLib from "pdfjs-dist/build/pdf";
+import "pdfjs-dist/build/pdf.worker";
+import { openDB } from "idb";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+
+const DB_NAME = "study-app-db";
+const DB_VERSION = 1;
+const PDF_STORE = "pdfs";
+
+async function getDb() {
+  return openDB(DB_NAME, DB_VERSION, {
+    upgrade(db) {
+      if (!db.objectStoreNames.contains(PDF_STORE)) {
+        db.createObjectStore(PDF_STORE);
+      }
+    },
+  });
+}
+
+async function savePdfBuffer(pdfId, buffer) {
+  const db = await getDb();
+  await db.put(PDF_STORE, buffer, pdfId);
+}
+
+async function loadPdfBuffer(pdfId) {
+  const db = await getDb();
+  return db.get(PDF_STORE, pdfId);
+}
+
+async function clearAllPdfs() {
+  const db = await getDb();
+  await db.clear(PDF_STORE);
+}
+
+function App() {
+  const DATA_VERSION = 13;
+
+  const [decks, setDecks] = useState([]);
+  const [sessionCards, setSessionCards] = useState([]);
+  const [currentCardIndex, setCurrentCardIndex] = useState(0);
+  const [showAnswer, setShowAnswer] = useState(false);
+  const [mode, setMode] = useState("review");
+  const [selectedDeckId, setSelectedDeckId] = useState(null);
+  const [now, setNow] = useState(new Date());
+  const [loaded, setLoaded] = useState(false);
+  const [sessionInitialized, setSessionInitialized] = useState(false);
+
+  const [pdfMap, setPdfMap] = useState({});
+  const [currentImage, setCurrentImage] = useState(null);
+
+  const shuffleArray = (array) => {
+    const copy = [...array];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  };
+
+  const getTitle = (items) => {
+    const sorted = [...items].sort((a, b) => (b.height || 0) - (a.height || 0));
+    return sorted[0]?.str || "";
+  };
+
+  const cleanTitle = (t) => (t || "").replace(/\s+/g, " ").trim();
+
+  const shouldSkipPage = () => false;
+
+  const getModeButtonStyle = (btnMode) => {
+    const active = mode === btnMode;
+
+    const bgMap = {
+      review: "#dbeafe",
+      study: "#dcfce7",
+      hidden: "#e5e7eb",
+    };
+
+    return {
+      padding: "10px 16px",
+      marginRight: "10px",
+      borderRadius: "8px",
+      border: "1px solid #cbd5e1",
+      cursor: "pointer",
+      background: active ? bgMap[btnMode] : "#f8fafc",
+      boxShadow: active
+        ? "inset 2px 2px 6px rgba(0,0,0,0.18)"
+        : "2px 2px 6px rgba(0,0,0,0.08)",
+      transform: active ? "translateY(1px)" : "none",
+      fontWeight: active ? "700" : "500",
+    };
+  };
+
+  useEffect(() => {
+    const loadApp = async () => {
+      try {
+        const saved = localStorage.getItem("decks");
+        const version = localStorage.getItem("version");
+
+        if (version !== String(DATA_VERSION)) {
+          localStorage.removeItem("decks");
+          await clearAllPdfs();
+          localStorage.setItem("version", String(DATA_VERSION));
+
+          setDecks([]);
+          setPdfMap({});
+          setSelectedDeckId(null);
+          setSessionCards([]);
+          setCurrentCardIndex(0);
+          setShowAnswer(false);
+          setCurrentImage(null);
+          setLoaded(true);
+          return;
+        }
+
+        let parsedDecks = [];
+
+        if (saved) {
+          try {
+            parsedDecks = JSON.parse(saved);
+            if (Array.isArray(parsedDecks)) {
+              setDecks(parsedDecks);
+              if (parsedDecks.length > 0) {
+                setSelectedDeckId(parsedDecks[0].id);
+              }
+            }
+          } catch (err) {
+            console.error("Failed to parse saved decks:", err);
+            parsedDecks = [];
+          }
+        }
+
+        const restoredPdfMap = {};
+        const pdfIds = [
+          ...new Set(
+            parsedDecks
+              .flatMap((deck) => deck.cards || [])
+              .map((card) => card.pdfId)
+              .filter(Boolean)
+          ),
+        ];
+
+        for (const pdfId of pdfIds) {
+          try {
+            const buffer = await loadPdfBuffer(pdfId);
+            if (!buffer) continue;
+
+            const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+            restoredPdfMap[pdfId] = pdf;
+          } catch (err) {
+            console.error(`Failed to restore PDF ${pdfId}:`, err);
+          }
+        }
+
+        setPdfMap(restoredPdfMap);
+      } finally {
+        setLoaded(true);
+      }
+    };
+
+    loadApp();
+  }, []);
+
+  useEffect(() => {
+    if (loaded) {
+      localStorage.setItem("decks", JSON.stringify(decks));
+    }
+  }, [decks, loaded]);
+
+  useEffect(() => {
+    const i = setInterval(() => setNow(new Date()), 5000);
+    return () => clearInterval(i);
+  }, []);
+
+  const allCards = useMemo(() => decks.flatMap((d) => d.cards || []), [decks]);
+
+  const visibleCards = allCards.filter((c) => !c.isSuspended);
+  const hiddenCards = allCards.filter((c) => c.isSuspended);
+
+  const dueCards = visibleCards.filter(
+    (c) => new Date(c.nextReviewDate) <= now
+  );
+
+  const selectedDeck = decks.find((d) => d.id === selectedDeckId);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (sessionInitialized) return;
+
+    if (mode === "review") {
+      setSessionCards(shuffleArray(dueCards));
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+      setShowAnswer(false);
+    }
+
+    if (mode === "study") {
+      const studyCards = selectedDeck
+        ? selectedDeck.cards.filter((c) => !c.isSuspended)
+        : [];
+      setSessionCards(shuffleArray(studyCards));
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+      setShowAnswer(false);
+    }
+
+    if (mode === "hidden") {
+      setSessionCards(hiddenCards);
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+      setShowAnswer(false);
+    }
+  }, [mode, loaded, sessionInitialized, selectedDeck, hiddenCards, dueCards]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (!sessionInitialized) return;
+    if (mode !== "review") return;
+
+    const newDue = dueCards.filter(
+      (card) => !sessionCards.some((c) => c.id === card.id)
+    );
+
+    if (newDue.length > 0) {
+      setSessionCards((prev) => [...prev, ...shuffleArray(newDue)]);
+    }
+  }, [dueCards, mode, sessionCards, sessionInitialized, loaded]);
+
+  useEffect(() => {
+    if (currentCardIndex >= sessionCards.length && sessionCards.length > 0) {
+      setCurrentCardIndex(0);
+    }
+  }, [sessionCards, currentCardIndex]);
+
+  const currentCard = sessionCards[currentCardIndex];
+
+  useEffect(() => {
+    const handleKey = (e) => {
+      if (!currentCard) return;
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        setShowAnswer(true);
+      }
+
+      if (!showAnswer) return;
+
+      if (e.key === "1") rateCard("Very Hard");
+      if (e.key === "2") rateCard("Hard");
+      if (e.key === "3") rateCard("Easy");
+      if (e.key === "4") rateCard("Very Easy");
+    };
+
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [currentCard, showAnswer]);
+
+  useEffect(() => {
+    const render = async () => {
+      if (!currentCard) {
+        setCurrentImage(null);
+        return;
+      }
+
+      if (!currentCard.pdfId) {
+        setCurrentImage(null);
+        return;
+      }
+
+      const pdf = pdfMap[currentCard.pdfId];
+      if (!pdf) {
+        setCurrentImage(null);
+        return;
+      }
+
+      try {
+        const page = await pdf.getPage(currentCard.pageNumber);
+        const viewport = page.getViewport({ scale: 1.2 });
+
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        setCurrentImage(canvas.toDataURL("image/png"));
+      } catch (err) {
+        console.error("Failed to render page:", err);
+        setCurrentImage(null);
+      }
+    };
+
+    render();
+  }, [currentCard, pdfMap]);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      console.log("START загрузки");
+
+      const originalBuffer = await file.arrayBuffer();
+
+      // 👇 делаем копии ДО передачи в pdf.js
+      const bufferForPdf = originalBuffer.slice(0);
+      const bufferForStorage = originalBuffer.slice(0);
+
+      // 👇 используем копию для pdf.js
+      const pdf = await pdfjsLib.getDocument({ data: bufferForPdf }).promise;
+
+      console.log("PDF pages:", pdf.numPages);
+
+      const pdfId = `pdf-${Date.now()}`;
+
+      // 👇 сохраняем ДРУГУЮ копию
+      await savePdfBuffer(pdfId, bufferForStorage);
+
+      setPdfMap((prev) => ({ ...prev, [pdfId]: pdf }));
+
+      const cards = [];
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+
+        const items = textContent.items || [];
+        const text = items.map((item) => item.str || "").join(" ").trim();
+
+        if (shouldSkipPage(text, i)) continue;
+
+        const title = cleanTitle(getTitle(items)) || `Page ${i}`;
+
+        cards.push({
+          id: `${pdfId}-${i}`,
+          question: `What is ${title}?`,
+          pdfId,
+          pageNumber: i,
+          nextReviewDate: new Date(Date.now() - 1000).toISOString(),
+          isSuspended: false,
+        });
+      }
+
+      console.log("CARDS:", cards.length);
+
+      if (cards.length === 0) {
+        alert("Не удалось создать карточки из PDF");
+        return;
+      }
+
+      const newDeck = {
+        id: `deck-${Date.now()}`,
+        name: file.name,
+        pdfId,
+        cards,
+      };
+
+      setDecks((prev) => [...prev, newDeck]);
+      setSelectedDeckId(newDeck.id);
+
+      setMode("study");
+      setSessionCards(shuffleArray(cards));
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+      setShowAnswer(false);
+
+      console.log("ГОТОВО");
+    } catch (err) {
+      console.error("Ошибка загрузки PDF:", err);
+      alert("Ошибка загрузки PDF. Проверь консоль.");
+    } finally {
+      e.target.value = "";
+    }
+  };
+
+  const startMode = (newMode) => {
+    setSessionInitialized(false);
+    setSessionCards([]);
+    setCurrentCardIndex(0);
+    setShowAnswer(false);
+    setMode(newMode);
+  };
+
+  const rateCard = (rating) => {
+    if (!currentCard) return;
+
+    const map = {
+      "Very Easy": 15,
+      Easy: 10,
+      Hard: 5,
+      "Very Hard": 1,
+    };
+
+    const next = new Date();
+    next.setMinutes(next.getMinutes() + map[rating]);
+
+    if (mode === "review") {
+      setDecks((prev) =>
+        prev.map((deck) => ({
+          ...deck,
+          cards: deck.cards.map((card) =>
+            card.id === currentCard.id
+              ? { ...card, nextReviewDate: next.toISOString() }
+              : card
+          ),
+        }))
+      );
+    }
+
+    setSessionCards((prev) => prev.filter((c) => c.id !== currentCard.id));
+    setShowAnswer(false);
+    setCurrentCardIndex(0);
+  };
+
+  const hideCard = () => {
+    if (!currentCard) return;
+
+    setDecks((prev) =>
+      prev.map((deck) => ({
+        ...deck,
+        cards: deck.cards.map((card) =>
+          card.id === currentCard.id
+            ? { ...card, isSuspended: true }
+            : card
+        ),
+      }))
+    );
+
+    setSessionCards((prev) => prev.filter((c) => c.id !== currentCard.id));
+    setShowAnswer(false);
+    setCurrentCardIndex(0);
+  };
+
+  const restoreCard = () => {
+    if (!currentCard) return;
+
+    setDecks((prev) =>
+      prev.map((deck) => ({
+        ...deck,
+        cards: deck.cards.map((card) =>
+          card.id === currentCard.id
+            ? { ...card, isSuspended: false }
+            : card
+        ),
+      }))
+    );
+
+    setSessionCards((prev) => prev.filter((c) => c.id !== currentCard.id));
+    setShowAnswer(false);
+    setCurrentCardIndex(0);
+  };
+
+  return (
+    <div style={{ padding: 30 }}>
+      <h1>📚 Study App</h1>
+
+      <input
+        type="file"
+        accept="application/pdf"
+        onChange={handleFile}
+      />
+
+      <hr />
+
+      <button
+        style={getModeButtonStyle("review")}
+        onClick={() => startMode("review")}
+      >
+        🔵 Review
+      </button>
+      <button
+        style={getModeButtonStyle("study")}
+        onClick={() => startMode("study")}
+      >
+        🟢 Study
+      </button>
+      <button
+        style={getModeButtonStyle("hidden")}
+        onClick={() => startMode("hidden")}
+      >
+        👁 Hidden
+      </button>
+
+      <p>Cards in session: {sessionCards.length}</p>
+      <p>Hidden cards: {hiddenCards.length}</p>
+
+      <hr />
+
+      {currentCard && (
+        <div>
+          <h3>{currentCard.question}</h3>
+
+          {!showAnswer ? (
+            <button onClick={() => setShowAnswer(true)}>
+              Show Answer (Space)
+            </button>
+          ) : (
+            <div>
+              {currentImage ? (
+                <img
+                  src={currentImage}
+                  alt="PDF page"
+                  style={{ width: "100%", maxWidth: 600, marginBottom: 12 }}
+                />
+              ) : (
+                <p>PDF page not available</p>
+              )}
+
+              {mode !== "hidden" && (
+                <div style={{ marginTop: 10 }}>
+                  <button onClick={() => rateCard("Very Hard")}>1 😵</button>
+                  <button onClick={() => rateCard("Hard")}>2 😬</button>
+                  <button onClick={() => rateCard("Easy")}>3 🙂</button>
+                  <button onClick={() => rateCard("Very Easy")}>4 😎</button>
+                  <button onClick={hideCard}>🚫 Hide</button>
+                </div>
+              )}
+
+              {mode === "hidden" && (
+                <button onClick={restoreCard}>♻️ Restore</button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {sessionCards.length === 0 && <p>No cards</p>}
+    </div>
+  );
+}
+
+export default App;

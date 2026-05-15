@@ -1,0 +1,388 @@
+import React, { useEffect, useMemo, useState } from "react";
+import * as pdfjsLib from "pdfjs-dist/build/pdf";
+import "pdfjs-dist/build/pdf.worker";
+
+function App() {
+  const DATA_VERSION = 12;
+
+  const [decks, setDecks] = useState([]);
+  const [sessionCards, setSessionCards] = useState([]);
+  const [currentCardIndex, setCurrentCardIndex] = useState(0);
+  const [showAnswer, setShowAnswer] = useState(false);
+  const [mode, setMode] = useState("review");
+  const [selectedDeckId, setSelectedDeckId] = useState(null);
+  const [now, setNow] = useState(new Date());
+  const [loaded, setLoaded] = useState(false);
+  const [sessionInitialized, setSessionInitialized] = useState(false);
+
+  const [pdfMap, setPdfMap] = useState({});
+  const [currentImage, setCurrentImage] = useState(null);
+
+  const skipPhrases = [
+    "overview",
+    "learning objectives",
+    "educational goal",
+    "why is this important",
+  ];
+
+  const shuffleArray = (array) => {
+    const copy = [...array];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  };
+
+  const getTitle = (items) => {
+    const sorted = [...items].sort((a, b) => b.height - a.height);
+    return sorted[0]?.str || "";
+  };
+
+  const cleanTitle = (t) => t.replace(/\s+/g, " ").trim();
+
+  const shouldSkipPage = (text, pageNumber) => {
+    if (pageNumber === 1) return true;
+    return skipPhrases.some((p) =>
+      text.toLowerCase().includes(p)
+    );
+  };
+
+  const getModeButtonStyle = (btnMode) => {
+    const active = mode === btnMode;
+
+    const bgMap = {
+      review: "#dbeafe",
+      study: "#dcfce7",
+      hidden: "#e5e7eb",
+    };
+
+    return {
+      padding: "10px 16px",
+      marginRight: "10px",
+      borderRadius: "8px",
+      border: "1px solid #cbd5e1",
+      cursor: "pointer",
+      background: active ? bgMap[btnMode] : "#f8fafc",
+      boxShadow: active
+        ? "inset 2px 2px 6px rgba(0,0,0,0.18)"
+        : "2px 2px 6px rgba(0,0,0,0.08)",
+      transform: active ? "translateY(1px)" : "none",
+      fontWeight: active ? "700" : "500",
+    };
+  };
+
+  useEffect(() => {
+    const saved = localStorage.getItem("decks");
+    const version = localStorage.getItem("version");
+
+    if (version !== String(DATA_VERSION)) {
+      localStorage.removeItem("decks");
+      localStorage.setItem("version", String(DATA_VERSION));
+
+      setDecks([]);
+      setSessionCards([]);
+      setCurrentCardIndex(0);
+      setSelectedDeckId(null);
+      setMode("review");
+      setSessionInitialized(false);
+    } else if (saved) {
+      const parsed = JSON.parse(saved);
+      setDecks(parsed);
+      if (parsed.length > 0) setSelectedDeckId(parsed[0].id);
+    }
+
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (loaded) {
+      localStorage.setItem("decks", JSON.stringify(decks));
+    }
+  }, [decks, loaded]);
+
+  useEffect(() => {
+    const i = setInterval(() => setNow(new Date()), 5000);
+    return () => clearInterval(i);
+  }, []);
+
+  const allCards = useMemo(() => decks.flatMap((d) => d.cards), [decks]);
+
+  const visibleCards = allCards.filter((c) => !c.isSuspended);
+  const hiddenCards = allCards.filter((c) => c.isSuspended);
+
+  const dueCards = visibleCards.filter(
+    (c) => new Date(c.nextReviewDate) <= now
+  );
+
+  const selectedDeck = decks.find((d) => d.id === selectedDeckId);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (sessionInitialized) return;
+
+    if (mode === "review") {
+      setSessionCards(shuffleArray(dueCards));
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+    }
+
+    if (mode === "study" && selectedDeck) {
+      setSessionCards(
+        selectedDeck.cards.filter((c) => !c.isSuspended)
+      );
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+    }
+
+    if (mode === "hidden") {
+      setSessionCards(hiddenCards);
+      setCurrentCardIndex(0);
+      setSessionInitialized(true);
+    }
+  }, [mode, loaded, sessionInitialized, selectedDeck, hiddenCards, dueCards]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (!sessionInitialized) return;
+    if (mode !== "review") return;
+
+    const newDue = dueCards.filter(
+      (card) => !sessionCards.some((c) => c.id === card.id)
+    );
+
+    if (newDue.length > 0) {
+      setSessionCards((prev) => [...prev, ...shuffleArray(newDue)]);
+    }
+  }, [dueCards, mode, sessionCards, sessionInitialized, loaded]);
+
+  const currentCard = sessionCards[currentCardIndex];
+
+  // 🔥 HOTKEYS
+  useEffect(() => {
+    const handleKey = (e) => {
+      if (!currentCard) return;
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        setShowAnswer(true);
+      }
+
+      if (!showAnswer) return;
+
+      if (e.key === "1") rateCard("Very Hard");
+      if (e.key === "2") rateCard("Hard");
+      if (e.key === "3") rateCard("Easy");
+      if (e.key === "4") rateCard("Very Easy");
+    };
+
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [currentCard, showAnswer]);
+
+  useEffect(() => {
+    const render = async () => {
+      if (!currentCard) return;
+
+      const pdf = pdfMap[currentCard.pdfId];
+      if (!pdf) return;
+
+      const page = await pdf.getPage(currentCard.pageNumber);
+      const viewport = page.getViewport({ scale: 1.2 });
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      setCurrentImage(canvas.toDataURL());
+    };
+
+    render();
+  }, [currentCard, pdfMap]);
+
+  const handleFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const buffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+
+    const pdfId = Date.now();
+
+    setPdfMap((prev) => ({ ...prev, [pdfId]: pdf }));
+
+    const cards = [];
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+
+      const items = textContent.items;
+      const text = items.map((i) => i.str).join(" ");
+
+      if (shouldSkipPage(text, i)) continue;
+
+      const title = cleanTitle(getTitle(items));
+      if (!title) continue;
+
+      cards.push({
+        id: `${pdfId}-${i}`,
+        question: `What is ${title}?`,
+        answer: text,
+        pdfId,
+        pageNumber: i,
+        nextReviewDate: new Date(Date.now() - 1000).toISOString(),
+        isSuspended: false,
+      });
+    }
+
+    const newDeck = {
+      id: Date.now(),
+      name: file.name,
+      cards,
+    };
+
+    setDecks((prev) => [...prev, newDeck]);
+    setSelectedDeckId(newDeck.id);
+    setSessionInitialized(false);
+    setMode("study");
+  };
+
+  const startMode = (newMode) => {
+    setSessionInitialized(false);
+    setSessionCards([]);
+    setCurrentCardIndex(0);
+    setShowAnswer(false);
+    setMode(newMode);
+  };
+
+  const rateCard = (rating) => {
+    if (!currentCard) return;
+
+    const map = {
+      "Very Easy": 15,
+      Easy: 10,
+      Hard: 5,
+      "Very Hard": 1,
+    };
+
+    const next = new Date();
+    next.setMinutes(next.getMinutes() + map[rating]);
+
+    if (mode === "review") {
+      setDecks((prev) =>
+        prev.map((deck) => ({
+          ...deck,
+          cards: deck.cards.map((card) =>
+            card.id === currentCard.id
+              ? { ...card, nextReviewDate: next.toISOString() }
+              : card
+          ),
+        }))
+      );
+    }
+
+    setSessionCards((prev) => prev.filter((c) => c.id !== currentCard.id));
+    setShowAnswer(false);
+  };
+
+  const hideCard = () => {
+    if (!currentCard) return;
+
+    setDecks((prev) =>
+      prev.map((deck) => ({
+        ...deck,
+        cards: deck.cards.map((card) =>
+          card.id === currentCard.id
+            ? { ...card, isSuspended: true }
+            : card
+        ),
+      }))
+    );
+
+    setSessionCards((prev) => prev.filter((c) => c.id !== currentCard.id));
+    setShowAnswer(false);
+  };
+
+  const restoreCard = () => {
+    if (!currentCard) return;
+
+    setDecks((prev) =>
+      prev.map((deck) => ({
+        ...deck,
+        cards: deck.cards.map((card) =>
+          card.id === currentCard.id
+            ? { ...card, isSuspended: false }
+            : card
+        ),
+      }))
+    );
+
+    setSessionCards((prev) => prev.filter((c) => c.id !== currentCard.id));
+    setShowAnswer(false);
+  };
+
+  return (
+    <div style={{ padding: 30 }}>
+      <h1>📚 Study App</h1>
+
+      <input type="file" onChange={handleFile} />
+
+      <hr />
+
+      <button style={getModeButtonStyle("review")} onClick={() => startMode("review")}>🔵 Review</button>
+      <button style={getModeButtonStyle("study")} onClick={() => startMode("study")}>🟢 Study</button>
+      <button style={getModeButtonStyle("hidden")} onClick={() => startMode("hidden")}>👁 Hidden</button>
+
+      <p>Cards in session: {sessionCards.length}</p>
+      <p>Hidden cards: {hiddenCards.length}</p>
+
+      <hr />
+
+      {currentCard && (
+        <div>
+          <h3>{currentCard.question}</h3>
+
+          {!showAnswer ? (
+            <button onClick={() => setShowAnswer(true)}>
+              Show Answer (Space)
+            </button>
+          ) : (
+            <div>
+              {currentImage && (
+                <img
+                  src={currentImage}
+                  style={{ width: "100%", maxWidth: 600, marginBottom: 12 }}
+                />
+              )}
+
+              <p>{currentCard.answer}</p>
+
+              {mode !== "hidden" && (
+                <div style={{ marginTop: 10 }}>
+                  <button onClick={() => rateCard("Very Hard")}>1 😵</button>
+                  <button onClick={() => rateCard("Hard")}>2 😬</button>
+                  <button onClick={() => rateCard("Easy")}>3 🙂</button>
+                  <button onClick={() => rateCard("Very Easy")}>4 😎</button>
+                  <button onClick={hideCard}>🚫 Hide</button>
+                </div>
+              )}
+
+              {mode === "hidden" && (
+                <button onClick={restoreCard}>♻️ Restore</button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {sessionCards.length === 0 && <p>No cards</p>}
+    </div>
+  );
+}
+
+export default App;
